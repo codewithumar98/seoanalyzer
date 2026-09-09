@@ -202,7 +202,7 @@ export async function analyzeYoutubeUrl(url) {
     );
 
     const errorMessage = isNetworkError
-      ? 'Unable to connect to analysis server at /api/analyze. Please ensure the backend server is running, or test the UI using the sample preview below.'
+      ? 'Network connection error. Please check your internet connection or verify the dev server is active.'
       : (err.message || 'An unexpected error occurred while analyzing the video.');
 
     return {

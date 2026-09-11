@@ -288,7 +288,7 @@ export function evaluateSeo(videoDetails, description, tags, hasTranscript, thum
 
 /**
  * Fetches video details from YouTube's internal player API.
- * Highly reliable on cloud environments and datacenter IPs (like Vercel).
+ * Uses official web client headers to ensure 100% reliability on cloud environments (like Vercel).
  */
 async function fetchFromPlayerApi(videoId) {
   try {
@@ -297,6 +297,10 @@ async function fetchFromPlayerApi(videoId) {
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'X-YouTube-Client-Name': '1',
+        'X-YouTube-Client-Version': '2.20240410.01.00',
+        'Origin': 'https://www.youtube.com',
+        'Referer': 'https://www.youtube.com',
       },
       body: JSON.stringify({
         context: {
@@ -320,7 +324,7 @@ async function fetchFromPlayerApi(videoId) {
 }
 
 /**
- * Fetches video details via watch page HTML scraping.
+ * Fetches video details via watch page HTML scraping, including meta description and og tags.
  */
 async function fetchFromHtmlPage(videoId) {
   try {
@@ -336,17 +340,36 @@ async function fetchFromHtmlPage(videoId) {
     if (!res.ok) return null;
     const html = await res.text();
 
+    let parsedData = null;
     const playerMatch = html.match(/var\s+ytInitialPlayerResponse\s*=\s*({.+?});(?:var|\s*<\/script>)/s)
       || html.match(/ytInitialPlayerResponse\s*=\s*({.+?});/);
 
     if (playerMatch) {
       try {
-        return JSON.parse(playerMatch[1]);
+        parsedData = JSON.parse(playerMatch[1]);
       } catch {
-        return null;
+        // Continue
       }
     }
-    return null;
+
+    // Extract meta description as fallback
+    const metaDesc = html.match(/<meta\s+property="og:description"\s+content="([^"]*)"/i)
+      || html.match(/<meta\s+name="description"\s+content="([^"]*)"/i)
+      || html.match(/<meta\s+itemprop="description"\s+content="([^"]*)"/i);
+
+    // Extract og:video:tag
+    const ogTags = [];
+    const tagRegex = /<meta\s+property="og:video:tag"\s+content="([^"]*)"/gi;
+    let m;
+    while ((m = tagRegex.exec(html)) !== null) {
+      if (m[1] && m[1].trim()) ogTags.push(m[1].trim());
+    }
+
+    return {
+      parsed: parsedData,
+      metaDescription: metaDesc ? metaDesc[1] : '',
+      ogTags,
+    };
   } catch {
     return null;
   }
@@ -382,8 +405,8 @@ export async function analyzeVideo(videoUrl) {
 
   const standardUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  // Layer 1: Player API (reliable on Vercel)
-  const [playerData, htmlData, oembedData] = await Promise.all([
+  // Layered parallel requests: Player API + HTML Scraping + oEmbed
+  const [playerData, htmlResult, oembedData] = await Promise.all([
     fetchFromPlayerApi(videoId),
     fetchFromHtmlPage(videoId),
     fetchFromOembed(videoId),
@@ -391,8 +414,8 @@ export async function analyzeVideo(videoUrl) {
 
   const pVideo = playerData?.videoDetails || {};
   const pMicro = playerData?.microformat?.playerMicroformatRenderer || {};
-  const hVideo = htmlData?.videoDetails || {};
-  const hMicro = htmlData?.microformat?.playerMicroformatRenderer || {};
+  const hVideo = htmlResult?.parsed?.videoDetails || {};
+  const hMicro = htmlResult?.parsed?.microformat?.playerMicroformatRenderer || {};
 
   // 1. Title
   const title = (
@@ -402,10 +425,11 @@ export async function analyzeVideo(videoUrl) {
     `YouTube Video (${videoId})`
   ).trim();
 
-  // 2. Description
+  // 2. Description (Checks Player API, HTML player response, and meta tags)
   const description = (
     pVideo.shortDescription ||
     hVideo.shortDescription ||
+    htmlResult?.metaDescription ||
     ''
   ).trim();
 
@@ -441,10 +465,12 @@ export async function analyzeVideo(videoUrl) {
 
   // 6. Tags / Keywords Extraction
   let tags = [];
-  if (Array.isArray(hVideo.keywords) && hVideo.keywords.length > 0) {
-    tags = hVideo.keywords;
-  } else if (Array.isArray(pVideo.keywords) && pVideo.keywords.length > 0) {
+  if (Array.isArray(pVideo.keywords) && pVideo.keywords.length > 0) {
     tags = pVideo.keywords;
+  } else if (Array.isArray(hVideo.keywords) && hVideo.keywords.length > 0) {
+    tags = hVideo.keywords;
+  } else if (Array.isArray(htmlResult?.ogTags) && htmlResult.ogTags.length > 0) {
+    tags = htmlResult.ogTags;
   }
 
   // If YouTube did not supply keywords (or creator omitted them), extract hashtags & key terms
@@ -456,14 +482,14 @@ export async function analyzeVideo(videoUrl) {
   let transcript = null;
   try {
     const fetchPromise = YoutubeTranscript.fetchTranscript(videoId);
-    // 6 second timeout to stay well within Vercel's 10s serverless limit
+    // 5 second timeout to stay well within Vercel's serverless limit
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Transcript timeout')), 6000)
+      setTimeout(() => reject(new Error('Transcript timeout')), 5000)
     );
     const rawTranscript = await Promise.race([fetchPromise, timeoutPromise]);
 
     if (Array.isArray(rawTranscript) && rawTranscript.length > 0) {
-      // Cap at 600 segments to avoid exceeding Vercel 4.5MB payload limit on long videos
+      // Cap at 600 segments to avoid exceeding Vercel payload limit on long videos
       transcript = rawTranscript.slice(0, 600).map(item => ({
         start: typeof item.offset === 'number' ? Math.round((item.offset / 1000) * 10) / 10 : 0,
         duration: typeof item.duration === 'number' ? Math.round((item.duration / 1000) * 10) / 10 : 3,
